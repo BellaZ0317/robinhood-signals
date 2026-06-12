@@ -1,0 +1,510 @@
+"""
+app.py  —  Abby 投资信号仪表盘
+Self-contained Streamlit app. No file writes needed.
+Deploy: streamlit.io/cloud (free)
+Local:  streamlit run app.py
+"""
+
+import streamlit as st
+import pandas as pd
+import numpy as np
+import yfinance as yf
+import plotly.graph_objects as go
+from datetime import date, timedelta
+
+# ── Page config ────────────────────────────────────────────────────────────────
+st.set_page_config(
+    page_title="📈 Abby 投资信号",
+    page_icon="📈",
+    layout="wide",
+    initial_sidebar_state="collapsed",
+)
+
+# ── Indicator functions ────────────────────────────────────────────────────────
+
+def sma(s, n):    return s.rolling(n).mean()
+def ema(s, n):    return s.ewm(span=n, adjust=False).mean()
+
+def rsi(s, n=14):
+    d = s.diff()
+    g = d.clip(lower=0).rolling(n).mean()
+    l = (-d.clip(upper=0)).rolling(n).mean()
+    return 100 - 100 / (1 + g / l.replace(0, np.nan))
+
+def macd(s, fast=12, slow=26, sig=9):
+    ml = ema(s, fast) - ema(s, slow)
+    sl = ml.ewm(span=sig, adjust=False).mean()
+    return ml, sl, ml - sl
+
+def bollinger(s, n=20, k=2):
+    mid = sma(s, n); std = s.rolling(n).std()
+    return mid + k * std, mid, mid - k * std
+
+def calc_atr(df, n=14):
+    h, l, c = df["High"], df["Low"], df["Close"]
+    tr = pd.concat([(h-l), (h-c.shift()).abs(), (l-c.shift()).abs()], axis=1).max(axis=1)
+    return tr.rolling(n).mean()
+
+def pct(s, n):
+    return (s.iloc[-1] / s.iloc[-n] - 1) * 100 if len(s) > n else np.nan
+
+
+# ── Candlestick pattern detection ──────────────────────────────────────────────
+
+def detect_patterns(df):
+    if len(df) < 3:
+        return []
+    patterns = []
+    o, h, l, c = df["Open"].values, df["High"].values, df["Low"].values, df["Close"].values
+    i = len(df) - 1
+    rng = h[i] - l[i]; body = abs(c[i] - o[i])
+    upper = h[i] - max(c[i], o[i]); lower = min(c[i], o[i]) - l[i]
+    bull = c[i] > o[i]
+    if rng < 0.001:
+        return patterns
+    br = body / rng
+    if br < 0.1:
+        patterns.append(("Doji",            "neutral", "十字星"))
+    elif lower/rng > 0.6 and br < 0.35 and bull:
+        patterns.append(("Hammer",          "bullish", "锤子线"))
+    elif lower/rng > 0.6 and br < 0.35 and not bull:
+        patterns.append(("Hanging Man",     "bearish", "吊颈线"))
+    elif upper/rng > 0.6 and br < 0.35 and not bull:
+        patterns.append(("Shooting Star",   "bearish", "射击之星"))
+    elif upper/rng > 0.6 and br < 0.35 and bull:
+        patterns.append(("Inverted Hammer", "bullish", "倒锤子线"))
+    elif br > 0.85:
+        patterns.append(("Bullish Marubozu" if bull else "Bearish Marubozu",
+                          "bullish" if bull else "bearish",
+                          "大阳线" if bull else "大阴线"))
+    if i >= 1:
+        p_lo = min(c[i-1], o[i-1]); p_hi = max(c[i-1], o[i-1])
+        c_lo = min(c[i],   o[i]);   c_hi = max(c[i],   o[i])
+        if c[i-1] < o[i-1] and bull and c_lo < p_lo and c_hi > p_hi:
+            patterns.append(("Bullish Engulfing", "bullish", "看涨吞没"))
+        elif c[i-1] > o[i-1] and not bull and c_lo < p_lo and c_hi > p_hi:
+            patterns.append(("Bearish Engulfing", "bearish", "看跌吞没"))
+    if i >= 2:
+        mid_rng  = h[i-1] - l[i-1]
+        mid_body = abs(c[i-1] - o[i-1])
+        small    = mid_body / (mid_rng + 0.001) < 0.3
+        if c[i-2] < o[i-2] and small and bull and c[i] > (o[i-2]+c[i-2])/2:
+            patterns.append(("Morning Star", "bullish", "早晨之星"))
+        if c[i-2] > o[i-2] and small and not bull and c[i] < (o[i-2]+c[i-2])/2:
+            patterns.append(("Evening Star", "bearish", "黄昏之星"))
+    return patterns
+
+
+# ── Signal scoring ─────────────────────────────────────────────────────────────
+
+def score_to_signal(score):
+    if   score >=  1.5: return "STRONG_BUY"
+    elif score >=  0.5: return "BUY"
+    elif score >= -0.5: return "HOLD"
+    elif score >= -1.5: return "SELL"
+    else:               return "STRONG_SELL"
+
+def analyze_df(ticker, df, bench_close):
+    if df is None or len(df) < 60:
+        return {"ticker": ticker, "error": "数据不足"}
+    close = df["Close"]; price = close.iloc[-1]
+    rsi14      = rsi(close).iloc[-1]
+    s20        = sma(close, 20).iloc[-1]
+    s50        = sma(close, 50).iloc[-1]
+    s200       = sma(close, 200).iloc[-1] if len(close) >= 200 else np.nan
+    ml, sl, hist = macd(close)
+    bb_up, _, bb_lo = bollinger(close)
+    bb_rng     = bb_up.iloc[-1] - bb_lo.iloc[-1]
+    bb_pct     = (price - bb_lo.iloc[-1]) / bb_rng * 100 if bb_rng > 0 else np.nan
+    atr14      = calc_atr(df).iloc[-1]
+    vol        = df["Volume"].iloc[-1]      if "Volume" in df.columns else np.nan
+    vol20      = df["Volume"].rolling(20).mean().iloc[-1] if "Volume" in df.columns else np.nan
+    vol_ratio  = vol / vol20 if not np.isnan(vol20) and vol20 > 0 else np.nan
+    ret_1w = pct(close, 5);  ret_1m = pct(close, 21)
+    ret_3m = pct(close, 63); ret_1y = pct(close, 252)
+    b_1w = pct(bench_close, 5);  b_1m = pct(bench_close, 21)
+    b_3m = pct(bench_close, 63); b_1y = pct(bench_close, 252)
+    patterns     = detect_patterns(df)
+    pattern_bias = sum(1 if b=="bullish" else -1 if b=="bearish" else 0 for _,b,_ in patterns)
+
+    # 1D
+    s1d = 0; w1d = []
+    if   rsi14 < 30: s1d += 2.0; w1d.append(f"RSI超卖({rsi14:.0f})")
+    elif rsi14 < 40: s1d += 1.0; w1d.append(f"RSI偏低({rsi14:.0f})")
+    elif rsi14 > 70: s1d -= 2.0; w1d.append(f"RSI超买({rsi14:.0f})")
+    elif rsi14 > 60: s1d -= 1.0; w1d.append(f"RSI偏高({rsi14:.0f})")
+    else:                         w1d.append(f"RSI中性({rsi14:.0f})")
+    if not np.isnan(bb_pct):
+        if   bb_pct < 20: s1d += 1.0; w1d.append(f"靠近布林下轨({bb_pct:.0f}%)")
+        elif bb_pct > 80: s1d -= 1.0; w1d.append(f"靠近布林上轨({bb_pct:.0f}%)")
+        else:                          w1d.append(f"布林带中区({bb_pct:.0f}%)")
+    s1d += pattern_bias * 0.5
+    for n, b, zh in patterns:
+        w1d.append(f"{zh}({n})")
+    if not np.isnan(vol_ratio):
+        if   vol_ratio > 1.5 and s1d > 0: s1d += 0.5; w1d.append(f"放量确认(×{vol_ratio:.1f})")
+        elif vol_ratio > 1.5 and s1d < 0: s1d -= 0.5; w1d.append(f"放量下跌(×{vol_ratio:.1f})")
+
+    # 1W
+    s1w = 0; w1w = []
+    if   rsi14 < 35: s1w += 1.5; w1w.append(f"RSI oversold({rsi14:.0f})")
+    elif rsi14 < 45: s1w += 0.5; w1w.append(f"RSI low({rsi14:.0f})")
+    elif rsi14 > 70: s1w -= 1.5; w1w.append(f"RSI overbought({rsi14:.0f})")
+    elif rsi14 > 60: s1w -= 0.5; w1w.append(f"RSI high({rsi14:.0f})")
+    else:                         w1w.append(f"RSI neutral({rsi14:.0f})")
+    s1w += 0.5 if price > s20 else -0.5; w1w.append("价格>SMA20" if price > s20 else "价格<SMA20")
+    s1w += 0.5 if hist.iloc[-1] > 0 else -0.5; w1w.append("MACD+" if hist.iloc[-1] > 0 else "MACD−")
+
+    # 1M
+    s1m = 0; w1m = []
+    s1m += 1.0 if price > s50 else -1.0; w1m.append("价格>SMA50" if price > s50 else "价格<SMA50")
+    s1m += 0.5 if ml.iloc[-1] > sl.iloc[-1] else -0.5
+    w1m.append("MACD上穿" if ml.iloc[-1] > sl.iloc[-1] else "MACD下穿")
+    a1m = ret_1m - b_1m if not np.isnan(b_1m) else 0
+    if a1m > 2: s1m += 0.5; w1m.append(f"跑赢SPY+{a1m:.1f}%")
+    elif a1m < -2: s1m -= 0.5; w1m.append(f"跑输SPY{a1m:.1f}%")
+
+    # 3M
+    s3m = 0; w3m = []
+    s3m += 0.5 if price > s50 else -0.5; w3m.append("价格>SMA50" if price > s50 else "价格<SMA50")
+    if not np.isnan(s200):
+        s3m += 1.0 if price > s200 else -1.0; w3m.append("价格>SMA200" if price > s200 else "价格<SMA200")
+    a3m = ret_3m - b_3m if not np.isnan(b_3m) else 0
+    if a3m > 3: s3m += 0.5; w3m.append(f"3M超额+{a3m:.1f}%")
+    elif a3m < -3: s3m -= 0.5; w3m.append(f"3M超额{a3m:.1f}%")
+
+    # 1Y
+    s1y = 0; w1y = []
+    if not np.isnan(s200):
+        s1y += 1.5 if price > s200 else -1.5
+        w1y.append("牛市结构(>SMA200)" if price > s200 else "熊市结构(<SMA200)")
+    a1y = ret_1y - b_1y if (not np.isnan(b_1y) and not np.isnan(ret_1y)) else 0
+    if a1y > 5: s1y += 0.5; w1y.append(f"年化超额+{a1y:.1f}%")
+    elif a1y < -5: s1y -= 0.5; w1y.append(f"年化超额{a1y:.1f}%")
+
+    return {
+        "ticker":      ticker,
+        "price":       round(price, 2),
+        "rsi14":       round(rsi14, 1),
+        "bb_pct":      round(bb_pct, 1)    if not np.isnan(bb_pct)    else None,
+        "atr14":       round(atr14, 2),
+        "vol_ratio":   round(vol_ratio, 2) if not np.isnan(vol_ratio) else None,
+        "ret_1w":      round(ret_1w, 2),
+        "ret_1m":      round(ret_1m, 2),
+        "ret_3m":      round(ret_3m, 2),
+        "ret_1y":      round(ret_1y, 2)    if not np.isnan(ret_1y)    else None,
+        "patterns_zh": " | ".join(f"{zh}({n})" for n,_,zh in patterns) or "无特殊K线形态",
+        "signal_1d":   score_to_signal(s1d),
+        "signal_1w":   score_to_signal(s1w),
+        "signal_1m":   score_to_signal(s1m),
+        "signal_3m":   score_to_signal(s3m),
+        "signal_1y":   score_to_signal(s1y),
+        "why_1d":      " | ".join(w1d),
+        "why_1w":      " | ".join(w1w),
+        "why_1m":      " | ".join(w1m),
+        "why_3m":      " | ".join(w3m),
+        "why_1y":      " | ".join(w1y),
+    }
+
+
+# ── Data fetching (cached 15 min) ─────────────────────────────────────────────
+
+@st.cache_data(ttl=900, show_spinner="📡 拉取市场数据中，约15秒…")
+def fetch_data(tickers_tuple):
+    end = date.today(); start = end - timedelta(days=400)
+    data = {}
+    for t in tickers_tuple:
+        try:
+            df = yf.download(t, start=str(start), end=str(end), auto_adjust=True, progress=False)
+            if isinstance(df.columns, pd.MultiIndex):
+                df.columns = df.columns.get_level_values(0)
+            df.index.name = "date"
+            if not df.empty:
+                data[t] = df.sort_index()
+        except Exception:
+            pass
+    return data
+
+
+# ── Chart builder ─────────────────────────────────────────────────────────────
+
+def scan_patterns(df):
+    """Scan all candles in last 90 days, return list of (date, name, zh, bias)."""
+    chart_df = df.tail(90)
+    out = []
+    for i in range(3, len(chart_df)):
+        sub = chart_df.iloc[: i + 1]
+        for name, bias, zh in detect_patterns(sub):
+            out.append((chart_df.index[i], name, zh, bias))
+    return out
+
+def make_chart(df, sig_1d):
+    chart_df = df.tail(90)
+    close    = df["Close"]
+    s20  = sma(close, 20).tail(90)
+    s50  = sma(close, 50).tail(90)
+    s200 = sma(close, 200).tail(90)
+    bb_up, _, bb_lo = bollinger(close)
+    bb_up = bb_up.tail(90); bb_lo = bb_lo.tail(90)
+
+    fig = go.Figure()
+
+    # BB shaded band
+    x_band = list(chart_df.index) + list(chart_df.index[::-1])
+    y_band = list(bb_up.values)   + list(bb_lo.values[::-1])
+    fig.add_trace(go.Scatter(x=x_band, y=y_band, fill="toself",
+        fillcolor="rgba(150,150,150,0.07)", line=dict(color="rgba(0,0,0,0)"),
+        showlegend=False, hoverinfo="skip"))
+    fig.add_trace(go.Scatter(x=chart_df.index, y=bb_up,
+        line=dict(color="rgba(130,130,130,0.55)", width=1, dash="dot"),
+        name="BB上轨", showlegend=False))
+    fig.add_trace(go.Scatter(x=chart_df.index, y=bb_lo,
+        line=dict(color="rgba(130,130,130,0.55)", width=1, dash="dot"),
+        name="BB下轨", showlegend=False))
+
+    # Candlestick
+    fig.add_trace(go.Candlestick(
+        x=chart_df.index,
+        open=chart_df["Open"], high=chart_df["High"],
+        low=chart_df["Low"],   close=chart_df["Close"],
+        increasing_line_color="#1a8f4a", decreasing_line_color="#c84b2b",
+        increasing_fillcolor="#1a8f4a", decreasing_fillcolor="#c84b2b",
+        name="K线",
+    ))
+
+    # SMA lines
+    for series, color, name in [(s20,"#2f5e99","SMA20"), (s50,"#a87619","SMA50"), (s200,"#646a73","SMA200")]:
+        fig.add_trace(go.Scatter(x=chart_df.index, y=series,
+            line=dict(color=color, width=1.5), name=name))
+
+    # Pattern annotations on candles
+    for dt, name, zh, bias in scan_patterns(df):
+        if dt not in chart_df.index:
+            continue
+        color  = "#c84b2b" if bias == "bearish" else "#1a8f4a" if bias == "bullish" else "#a87619"
+        y_val  = float(chart_df.loc[dt, "High"]) if bias == "bearish" else float(chart_df.loc[dt, "Low"])
+        ay     = -28 if bias == "bearish" else 28
+        fig.add_annotation(
+            x=dt, y=y_val, text=zh[:3],
+            showarrow=True, arrowhead=2, arrowcolor=color, arrowsize=1.2,
+            font=dict(size=9, color=color),
+            ay=ay, ax=0,
+            bgcolor="white", bordercolor=color, borderwidth=1, borderpad=2,
+        )
+
+    # Today's overall signal — prominent label
+    last_dt   = chart_df.index[-1]
+    last_high = float(chart_df["High"].iloc[-1])
+    last_low  = float(chart_df["Low"].iloc[-1])
+    if sig_1d in ("STRONG_BUY", "BUY"):
+        fig.add_annotation(x=last_dt, y=last_low, text=f"今日\n{sig_1d}",
+            showarrow=True, arrowhead=2, arrowcolor="#0a4d25", arrowsize=1.5,
+            font=dict(size=10, color="#0a4d25", family="Arial"),
+            ay=42, ax=0, bgcolor="#d4f0de", bordercolor="#0a4d25", borderwidth=2, borderpad=3)
+    elif sig_1d in ("STRONG_SELL", "SELL"):
+        fig.add_annotation(x=last_dt, y=last_high, text=f"今日\n{sig_1d}",
+            showarrow=True, arrowhead=2, arrowcolor="#7a1000", arrowsize=1.5,
+            font=dict(size=10, color="#7a1000", family="Arial"),
+            ay=-42, ax=0, bgcolor="#fde8e3", bordercolor="#7a1000", borderwidth=2, borderpad=3)
+
+    fig.update_layout(
+        height=380, margin=dict(l=0, r=0, t=8, b=0),
+        xaxis_rangeslider_visible=False,
+        legend=dict(orientation="h", yanchor="bottom", y=1.01,
+                    xanchor="left", x=0, font=dict(size=11)),
+        paper_bgcolor="white", plot_bgcolor="#fafbfc",
+        xaxis=dict(showgrid=True, gridcolor="#efefef"),
+        yaxis=dict(showgrid=True, gridcolor="#efefef"),
+    )
+    return fig
+
+
+# ── Signal display helpers ─────────────────────────────────────────────────────
+
+SIGNAL_COLOR = {
+    "STRONG_BUY": "#1a8f4a", "BUY": "#247d76",
+    "HOLD": "#a87619", "SELL": "#c84b2b", "STRONG_SELL": "#8b1a0a",
+}
+SIGNAL_ZH = {
+    "STRONG_BUY": "强力买入", "BUY": "买入",
+    "HOLD": "持有", "SELL": "卖出", "STRONG_SELL": "强力卖出",
+}
+
+def badge_html(sig):
+    c = SIGNAL_COLOR.get(sig, "#646a73"); zh = SIGNAL_ZH.get(sig, sig)
+    return (f'<span style="background:{c};color:#fff;padding:4px 12px;'
+            f'border-radius:8px;font-size:12px;font-weight:700">{zh}</span>')
+
+def colored_pct(v):
+    if v is None: return "—"
+    try:
+        f = float(v); c = "#1a8f4a" if f >= 0 else "#c84b2b"
+        return f'<span style="color:{c};font-weight:600">{f:+.1f}%</span>'
+    except Exception:
+        return "—"
+
+
+# ── Main App ───────────────────────────────────────────────────────────────────
+
+DEFAULT_TICKERS = ["VOO", "QQQ", "NVDA", "SMH", "FCX"]
+
+def main():
+    # ── Header ────────────────────────────────────────────────────────────
+    st.markdown("## 📈 Abby 投资信号仪表盘")
+    st.caption(f"数据来源：Yahoo Finance（15分钟延迟）&nbsp;&nbsp;|&nbsp;&nbsp;更新时间：{date.today()}")
+
+    # ── Sidebar ───────────────────────────────────────────────────────────
+    with st.sidebar:
+        st.markdown("### ⚙️ 设置")
+        custom_input = st.text_input(
+            "➕ 临时添加标的", placeholder="TSLA, MSFT, AAPL …",
+            help="输入股票代码（英文大写），用逗号分隔"
+        )
+        all_tickers = DEFAULT_TICKERS.copy()
+        if custom_input:
+            extras = [t.strip().upper() for t in custom_input.split(",") if t.strip()]
+            all_tickers = list(dict.fromkeys(all_tickers + extras))
+
+        if st.button("🔄 立即刷新数据", use_container_width=True, type="primary"):
+            st.cache_data.clear()
+            st.rerun()
+
+        st.divider()
+        st.markdown("**当前监控标的**")
+        for t in all_tickers:
+            st.markdown(f"- {t}")
+        st.divider()
+        st.markdown("**图表图例**")
+        st.markdown("🟢 绿色箭头 = 看涨K线形态\n\n🔴 红色箭头 = 看跌K线形态\n\n虚线 = Bollinger Bands 布林带")
+
+    # ── Fetch ─────────────────────────────────────────────────────────────
+    data = fetch_data(tuple(all_tickers + ["SPY"]))
+    if "SPY" not in data:
+        st.error("🚫 网络错误，无法获取数据。请点击侧边栏 [立即刷新数据] 重试。")
+        return
+
+    bench = data["SPY"]["Close"]
+
+    results = []
+    for t in all_tickers:
+        if t not in data:
+            st.warning(f"⚠️ {t} 数据获取失败，跳过")
+            continue
+        r = analyze_df(t, data[t], bench)
+        if "error" not in r:
+            results.append(r)
+
+    if not results:
+        st.error("没有可分析的数据")
+        return
+
+    # ── Summary table ─────────────────────────────────────────────────────
+    st.markdown("### 信号总览")
+
+    header = ["标的", "价格", "今日 1D", "本周 1W", "本月 1M", "三月 3M", "全年 1Y", "1周±", "1月±", "3月±", "1年±"]
+    rows = []
+    for r in results:
+        rows.append([
+            f"**{r['ticker']}**",
+            f"${r['price']:.2f}",
+            badge_html(r["signal_1d"]),
+            badge_html(r["signal_1w"]),
+            badge_html(r["signal_1m"]),
+            badge_html(r["signal_3m"]),
+            badge_html(r["signal_1y"]),
+            colored_pct(r["ret_1w"]),
+            colored_pct(r["ret_1m"]),
+            colored_pct(r["ret_3m"]),
+            colored_pct(r.get("ret_1y")),
+        ])
+
+    table_md = (
+        "<style>.sum-tbl{width:100%;border-collapse:collapse;font-size:13px}"
+        ".sum-tbl th{background:#f1f4f6;padding:8px 10px;text-align:center;border-bottom:2px solid #d9dde3;white-space:nowrap}"
+        ".sum-tbl td{padding:8px 10px;border-bottom:1px solid #d9dde3;text-align:center;white-space:nowrap}"
+        ".sum-tbl td:first-child{text-align:left}</style>"
+        '<table class="sum-tbl"><thead><tr>'
+        + "".join(f"<th>{h}</th>" for h in header)
+        + "</tr></thead><tbody>"
+        + "".join(
+            "<tr>" + "".join(f"<td>{c}</td>" for c in row) + "</tr>"
+            for row in rows
+        )
+        + "</tbody></table>"
+    )
+    st.markdown(table_md, unsafe_allow_html=True)
+    st.divider()
+
+    # ── Per-ticker K-line sections ────────────────────────────────────────
+    st.markdown("### K 线图 & 信号详情")
+    st.caption("点击标题展开/收起  |  绿色↑ = 看涨形态  |  红色↓ = 看跌形态  |  虚线区间 = Bollinger Bands")
+
+    for r in results:
+        t      = r["ticker"]
+        sig_1d = r["signal_1d"]
+        sig_zh = SIGNAL_ZH.get(sig_1d, sig_1d)
+        sig_c  = SIGNAL_COLOR.get(sig_1d, "#666")
+        label  = (f"**{t}** &nbsp; ${r['price']:.2f} &nbsp; — &nbsp;"
+                  f"<span style='color:{sig_c};font-weight:700'>今日：{sig_zh}</span>")
+
+        with st.expander(label, expanded=(t in ("QQQ", "NVDA", "SMH"))):
+
+            # ── Indicator row ─────────────────────────────────────────────
+            c1, c2, c3, c4 = st.columns(4)
+            bb_val = r.get("bb_pct")
+            vr_val = r.get("vol_ratio")
+            c1.metric("RSI（买卖力度）",      f"{r['rsi14']:.1f}",
+                      delta=("超买区 Overbought" if r["rsi14"] > 70
+                             else "超卖区 Oversold" if r["rsi14"] < 30 else None),
+                      delta_color="inverse")
+            c2.metric("Bollinger Bands 位置", f"{bb_val:.0f}%" if bb_val is not None else "—",
+                      help="0%=下轨(低估区)  100%=上轨(高估区)")
+            c3.metric("ATR 日均波动",          f"${r['atr14']:.2f}",
+                      help="每天平均波动幅度，越大越波动")
+            c4.metric("成交量/20日均量",        f"{vr_val:.1f}×" if vr_val else "—",
+                      help=">1.5倍代表放量，配合信号方向看")
+
+            # ── Signal badges ─────────────────────────────────────────────
+            cols = st.columns(5)
+            for col, (tf, key) in zip(cols, [
+                ("今日 1D", "signal_1d"), ("本周 1W", "signal_1w"),
+                ("本月 1M", "signal_1m"), ("三月 3M", "signal_3m"),
+                ("全年 1Y", "signal_1y"),
+            ]):
+                s = r[key]
+                col.markdown(
+                    f"<div style='text-align:center'>"
+                    f"<div style='font-size:11px;color:#646a73;margin-bottom:4px'>{tf}</div>"
+                    f"<span style='background:{SIGNAL_COLOR.get(s,'#666')};color:#fff;"
+                    f"padding:4px 12px;border-radius:8px;font-size:12px;font-weight:700'>"
+                    f"{SIGNAL_ZH.get(s,s)}</span></div>",
+                    unsafe_allow_html=True,
+                )
+
+            st.markdown("")
+
+            # ── Candlestick chart ─────────────────────────────────────────
+            fig = make_chart(data[t], sig_1d)
+            st.plotly_chart(fig, use_container_width=True,
+                            config={"displayModeBar": False, "scrollZoom": False})
+
+            # ── Pattern + reasoning ───────────────────────────────────────
+            p_col, w_col = st.columns([1, 2])
+            with p_col:
+                st.markdown("**📌 今日K线形态**")
+                st.markdown(r["patterns_zh"])
+            with w_col:
+                st.markdown("**🔍 信号理由**")
+                for tf, key in [
+                    ("今日", "why_1d"), ("本周", "why_1w"),
+                    ("本月", "why_1m"), ("三月", "why_3m"), ("全年", "why_1y"),
+                ]:
+                    st.markdown(
+                        f"<span style='font-weight:700;min-width:32px;display:inline-block'>{tf}</span>"
+                        f"<span style='color:#646a73;font-size:13px'>&nbsp;{r.get(key,'—')}</span>",
+                        unsafe_allow_html=True,
+                    )
+
+
+if __name__ == "__main__":
+    main()
