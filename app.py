@@ -346,66 +346,15 @@ def colored_pct(v):
 
 # ── Main App ───────────────────────────────────────────────────────────────────
 
-DEFAULT_TICKERS = ["VOO", "QQQ", "NVDA", "SMH", "FCX"]
+HOLDINGS  = ["VOO", "QQQ", "NVDA"]          # 我现在持有的
+WATCHLIST = ["SMH", "FCX", "AMAT", "LRCX"]  # 观察中，还没买
 
-def main():
-    # ── Header ────────────────────────────────────────────────────────────
-    st.markdown("## 📈 Abby 投资信号仪表盘")
-    st.caption(f"数据来源：Yahoo Finance（15分钟延迟）&nbsp;&nbsp;|&nbsp;&nbsp;更新时间：{date.today()}")
-
-    # ── Sidebar ───────────────────────────────────────────────────────────
-    with st.sidebar:
-        st.markdown("### ⚙️ 设置")
-        custom_input = st.text_input(
-            "➕ 临时添加标的", placeholder="TSLA, MSFT, AAPL …",
-            help="输入股票代码（英文大写），用逗号分隔"
-        )
-        all_tickers = DEFAULT_TICKERS.copy()
-        if custom_input:
-            extras = [t.strip().upper() for t in custom_input.split(",") if t.strip()]
-            all_tickers = list(dict.fromkeys(all_tickers + extras))
-
-        if st.button("🔄 立即刷新数据", use_container_width=True, type="primary"):
-            st.cache_data.clear()
-            st.rerun()
-
-        st.divider()
-        st.markdown("**当前监控标的**")
-        for t in all_tickers:
-            st.markdown(f"- {t}")
-        st.divider()
-        st.markdown("**图表图例**")
-        st.markdown("🟢 绿色箭头 = 看涨K线形态\n\n🔴 红色箭头 = 看跌K线形态\n\n虚线 = Bollinger Bands 布林带")
-
-    # ── Fetch ─────────────────────────────────────────────────────────────
-    data = fetch_data(tuple(all_tickers + ["SPY"]))
-    if "SPY" not in data:
-        st.error("🚫 网络错误，无法获取数据。请点击侧边栏 [立即刷新数据] 重试。")
-        return
-
-    bench = data["SPY"]["Close"]
-
-    results = []
-    for t in all_tickers:
-        if t not in data:
-            st.warning(f"⚠️ {t} 数据获取失败，跳过")
-            continue
-        r = analyze_df(t, data[t], bench)
-        if "error" not in r:
-            results.append(r)
-
-    if not results:
-        st.error("没有可分析的数据")
-        return
-
-    # ── Summary table ─────────────────────────────────────────────────────
-    st.markdown("### 信号总览")
-
+def render_table(results):
     header = ["标的", "价格", "今日 1D", "本周 1W", "本月 1M", "三月 3M", "全年 1Y", "1周±", "1月±", "3月±", "1年±"]
     rows = []
     for r in results:
         rows.append([
-            f"**{r['ticker']}**",
+            f"<strong>{r['ticker']}</strong>",
             f"${r['price']:.2f}",
             badge_html(r["signal_1d"]),
             badge_html(r["signal_1w"]),
@@ -417,8 +366,7 @@ def main():
             colored_pct(r["ret_3m"]),
             colored_pct(r.get("ret_1y")),
         ])
-
-    table_md = (
+    html = (
         "<style>.sum-tbl{width:100%;border-collapse:collapse;font-size:13px}"
         ".sum-tbl th{background:#f1f4f6;padding:8px 10px;text-align:center;border-bottom:2px solid #d9dde3;white-space:nowrap}"
         ".sum-tbl td{padding:8px 10px;border-bottom:1px solid #d9dde3;text-align:center;white-space:nowrap}"
@@ -426,50 +374,35 @@ def main():
         '<table class="sum-tbl"><thead><tr>'
         + "".join(f"<th>{h}</th>" for h in header)
         + "</tr></thead><tbody>"
-        + "".join(
-            "<tr>" + "".join(f"<td>{c}</td>" for c in row) + "</tr>"
-            for row in rows
-        )
+        + "".join("<tr>" + "".join(f"<td>{c}</td>" for c in row) + "</tr>" for row in rows)
         + "</tbody></table>"
     )
-    st.markdown(table_md, unsafe_allow_html=True)
-    st.divider()
+    st.markdown(html, unsafe_allow_html=True)
 
-    # ── Per-ticker K-line sections ────────────────────────────────────────
-    st.markdown("### K 线图 & 信号详情")
-    st.caption("点击标题展开/收起  |  绿色↑ = 看涨形态  |  红色↓ = 看跌形态  |  虚线区间 = Bollinger Bands")
-
+def render_charts(results, data, label):
+    st.caption(f"{label}  |  绿色↑ = 看涨形态  |  红色↓ = 看跌形态  |  虚线 = Bollinger Bands")
     for r in results:
         t      = r["ticker"]
         sig_1d = r["signal_1d"]
         sig_zh = SIGNAL_ZH.get(sig_1d, sig_1d)
         sig_c  = SIGNAL_COLOR.get(sig_1d, "#666")
-        label  = (f"**{t}** &nbsp; ${r['price']:.2f} &nbsp; — &nbsp;"
-                  f"<span style='color:{sig_c};font-weight:700'>今日：{sig_zh}</span>")
-
-        with st.expander(label, expanded=(t in ("QQQ", "NVDA", "SMH"))):
-
-            # ── Indicator row ─────────────────────────────────────────────
+        label_str = (f"**{t}** &nbsp; ${r['price']:.2f} &nbsp; — &nbsp;"
+                     f"<span style='color:{sig_c};font-weight:700'>今日：{sig_zh}</span>")
+        with st.expander(label_str, expanded=(t in ("QQQ", "NVDA"))):
             c1, c2, c3, c4 = st.columns(4)
-            bb_val = r.get("bb_pct")
-            vr_val = r.get("vol_ratio")
-            c1.metric("RSI（买卖力度）",      f"{r['rsi14']:.1f}",
-                      delta=("超买区 Overbought" if r["rsi14"] > 70
-                             else "超卖区 Oversold" if r["rsi14"] < 30 else None),
+            bb_val = r.get("bb_pct"); vr_val = r.get("vol_ratio")
+            c1.metric("RSI", f"{r['rsi14']:.1f}",
+                      delta=("超买 Overbought" if r["rsi14"]>70 else "超卖 Oversold" if r["rsi14"]<30 else None),
                       delta_color="inverse")
             c2.metric("Bollinger Bands 位置", f"{bb_val:.0f}%" if bb_val is not None else "—",
-                      help="0%=下轨(低估区)  100%=上轨(高估区)")
-            c3.metric("ATR 日均波动",          f"${r['atr14']:.2f}",
-                      help="每天平均波动幅度，越大越波动")
-            c4.metric("成交量/20日均量",        f"{vr_val:.1f}×" if vr_val else "—",
-                      help=">1.5倍代表放量，配合信号方向看")
+                      help="0%=下轨  100%=上轨")
+            c3.metric("ATR 日均波动", f"${r['atr14']:.2f}")
+            c4.metric("成交量/20日均", f"{vr_val:.1f}×" if vr_val else "—")
 
-            # ── Signal badges ─────────────────────────────────────────────
             cols = st.columns(5)
             for col, (tf, key) in zip(cols, [
-                ("今日 1D", "signal_1d"), ("本周 1W", "signal_1w"),
-                ("本月 1M", "signal_1m"), ("三月 3M", "signal_3m"),
-                ("全年 1Y", "signal_1y"),
+                ("今日 1D","signal_1d"),("本周 1W","signal_1w"),
+                ("本月 1M","signal_1m"),("三月 3M","signal_3m"),("全年 1Y","signal_1y"),
             ]):
                 s = r[key]
                 col.markdown(
@@ -480,30 +413,87 @@ def main():
                     f"{SIGNAL_ZH.get(s,s)}</span></div>",
                     unsafe_allow_html=True,
                 )
-
             st.markdown("")
-
-            # ── Candlestick chart ─────────────────────────────────────────
             fig = make_chart(data[t], sig_1d)
-            st.plotly_chart(fig, use_container_width=True,
-                            config={"displayModeBar": False, "scrollZoom": False})
-
-            # ── Pattern + reasoning ───────────────────────────────────────
+            st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
             p_col, w_col = st.columns([1, 2])
             with p_col:
                 st.markdown("**📌 今日K线形态**")
                 st.markdown(r["patterns_zh"])
             with w_col:
                 st.markdown("**🔍 信号理由**")
-                for tf, key in [
-                    ("今日", "why_1d"), ("本周", "why_1w"),
-                    ("本月", "why_1m"), ("三月", "why_3m"), ("全年", "why_1y"),
-                ]:
+                for tf, key in [("今日","why_1d"),("本周","why_1w"),("本月","why_1m"),("三月","why_3m"),("全年","why_1y")]:
                     st.markdown(
                         f"<span style='font-weight:700;min-width:32px;display:inline-block'>{tf}</span>"
                         f"<span style='color:#646a73;font-size:13px'>&nbsp;{r.get(key,'—')}</span>",
                         unsafe_allow_html=True,
                     )
+
+def main():
+    # ── Header ────────────────────────────────────────────────────────────
+    st.markdown("## 📈 Abby 投资信号仪表盘")
+    st.caption(f"数据来源：Yahoo Finance（15分钟延迟）&nbsp;&nbsp;|&nbsp;&nbsp;更新时间：{date.today()}")
+
+    # ── Sidebar ───────────────────────────────────────────────────────────
+    with st.sidebar:
+        st.markdown("### ⚙️ 设置")
+        custom_input = st.text_input(
+            "➕ 临时添加标的", placeholder="TSLA, MSFT …",
+            help="输入股票代码（英文大写），加到观察名单"
+        )
+        extra_tickers = []
+        if custom_input:
+            extra_tickers = [t.strip().upper() for t in custom_input.split(",") if t.strip()]
+
+        if st.button("🔄 立即刷新数据", use_container_width=True, type="primary"):
+            st.cache_data.clear()
+            st.rerun()
+
+        st.divider()
+        st.markdown("**我的持仓**")
+        for t in HOLDINGS:  st.markdown(f"- {t}")
+        st.markdown("**观察名单**")
+        for t in WATCHLIST + extra_tickers: st.markdown(f"- {t}")
+        st.divider()
+        st.markdown("🟢 绿色↑ = 看涨K线形态\n\n🔴 红色↓ = 看跌K线形态\n\n虚线 = Bollinger Bands")
+
+    # ── Fetch ─────────────────────────────────────────────────────────────
+    all_tickers = list(dict.fromkeys(HOLDINGS + WATCHLIST + extra_tickers))
+    data = fetch_data(tuple(all_tickers + ["SPY"]))
+    if "SPY" not in data:
+        st.error("🚫 网络错误，无法获取数据。请点击侧边栏 [立即刷新数据] 重试。")
+        return
+
+    bench = data["SPY"]["Close"]
+
+    def get_results(tickers):
+        out = []
+        for t in tickers:
+            if t not in data:
+                st.warning(f"⚠️ {t} 数据获取失败")
+                continue
+            r = analyze_df(t, data[t], bench)
+            if "error" not in r:
+                out.append(r)
+        return out
+
+    holding_results  = get_results(HOLDINGS)
+    watchlist_results = get_results(WATCHLIST + extra_tickers)
+
+    # ── 我的持仓 ──────────────────────────────────────────────────────────
+    st.markdown("### 💼 我的持仓")
+    if holding_results:
+        render_table(holding_results)
+        st.divider()
+        render_charts(holding_results, data, "点击展开 K 线图")
+
+    # ── 观察名单 ──────────────────────────────────────────────────────────
+    st.markdown("### 👀 观察名单 Watchlist")
+    st.caption("还没买，在看时机")
+    if watchlist_results:
+        render_table(watchlist_results)
+        st.divider()
+        render_charts(watchlist_results, data, "点击展开 K 线图")
 
 
 if __name__ == "__main__":
