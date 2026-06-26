@@ -381,15 +381,34 @@ def compute_positions(txn_df):
     return {t: p for t, p in positions.items() if p["shares"] > 1e-6}
 
 def load_buy_plan():
+    """Returns {ticker: {category, monthly_budget_usd}}. Each ticker gets a fresh
+    budget every calendar month — unused budget does NOT roll over."""
     if not BUY_PLAN_PATH.exists():
         return {}
     df = pd.read_csv(BUY_PLAN_PATH)
-    return dict(zip(df["ticker"], df["budget_usd"]))
+    return {
+        row["ticker"]: {"category": row["category"], "monthly_budget_usd": row["monthly_budget_usd"]}
+        for _, row in df.iterrows()
+    }
+
+def monthly_spent(txn_df, ticker, today=None):
+    """Sum of buy amounts for this ticker in the current calendar month."""
+    if txn_df is None:
+        return 0.0
+    today = today or date.today()
+    mask = (
+        (txn_df["ticker"] == ticker)
+        & (txn_df["action"] == "buy")
+        & (txn_df["date"].dt.year == today.year)
+        & (txn_df["date"].dt.month == today.month)
+    )
+    return float(txn_df.loc[mask, "amount_usd"].sum())
 
 
 # ── Buy-zone (加仓价位) logic ───────────────────────────────────────────────────
 
 BUY_ZONE_TIERS = [("浅回撤", 0.92), ("中等回撤", 0.85), ("深度回撤", 0.75)]
+TIER_RATIOS = (0.3, 0.3, 0.4)
 
 def compute_buy_zones(df):
     """Pullback tiers off the trailing ~6-month closing high. Public-safe — no $ amounts."""
@@ -407,14 +426,17 @@ def compute_buy_zones(df):
         })
     return {"recent_high": recent_high, "price": price, "tiers": tiers}
 
-def render_buy_zones(results, data, positions, budgets):
+def render_buy_zones(results, data, positions, budgets, txn_df):
     st.markdown("### 🎯 加仓 / 建仓价位参考")
-    st.caption("基于近6个月收盘高点的回撤档位，越跌建议买得越多。技术面参考，不是预测。")
+    st.caption(
+        "基于近6个月收盘高点的回撤档位，越跌建议买得越多。技术面参考，不是预测。"
+        + ("　|　金额按本月剩余预算计算，每月初自动重置，不累加到下月。" if budgets else "")
+    )
 
     has_personal = bool(positions)
     header = ["标的", "现价", "近6月高点", "档1 浅回撤(-8%)", "档2 中等回撤(-15%)", "档3 深度回撤(-25%)"]
     if has_personal:
-        header += ["你的持仓", "档1/2/3 建议金额"]
+        header += ["你的持仓"]
 
     rows = []
     for r in results:
@@ -422,11 +444,25 @@ def render_buy_zones(results, data, positions, budgets):
         if t not in data:
             continue
         z = compute_buy_zones(data[t])
-        cells = [f"<strong>{t}</strong>", f"${z['price']:.2f}", f"${z['recent_high']:.2f}"]
-        for tier in z["tiers"]:
+        plan = budgets.get(t)
+        remaining = None
+        ticker_cell = f"<strong>{t}</strong>"
+        if plan:
+            spent = monthly_spent(txn_df, t)
+            remaining = max(0.0, plan["monthly_budget_usd"] - spent)
+            ticker_cell += (
+                f"<br><span style='font-size:10px;color:#646a73'>"
+                f"本月已花${spent:.0f}/${plan['monthly_budget_usd']:.0f}</span>"
+            )
+
+        cells = [ticker_cell, f"${z['price']:.2f}", f"${z['recent_high']:.2f}"]
+        for tier, ratio in zip(z["tiers"], TIER_RATIOS):
             tag = "✅ 已触发" if tier["triggered"] else f"还差 {tier['gap_pct']:.1f}%"
             color = "#1a8f4a" if tier["triggered"] else "#646a73"
-            cells.append(f"${tier['price']:.2f}<br><span style='color:{color};font-size:11px'>{tag}</span>")
+            line = f"${tier['price']:.2f}<br><span style='color:{color};font-size:11px'>{tag}</span>"
+            if remaining is not None:
+                line += f"<br><span style='font-size:11px;font-weight:700'>建议 ${remaining*ratio:.0f}</span>"
+            cells.append(line)
         if has_personal:
             pos = positions.get(t)
             if pos:
@@ -438,12 +474,6 @@ def render_buy_zones(results, data, positions, budgets):
                 )
             else:
                 cells.append("—")
-            budget = budgets.get(t)
-            if budget:
-                amounts = " / ".join(f"${budget*ratio:.0f}" for ratio in (0.3, 0.3, 0.4))
-                cells.append(amounts)
-            else:
-                cells.append("未设预算")
         rows.append(cells)
 
     if not rows:
@@ -496,7 +526,7 @@ def render_voo_recurring_check(data):
 # ── Main App ───────────────────────────────────────────────────────────────────
 
 HOLDINGS  = ["VOO", "QQQ", "NVDA"]          # 我现在持有的
-WATCHLIST = ["SMH", "FCX", "AMAT", "LRCX"]  # 观察中，还没买
+WATCHLIST = ["SMH", "FCX", "AMAT", "LRCX", "MU"]  # 观察中，还没买
 
 def render_table(results):
     header = ["标的", "价格", "今日 1D", "本周 1W", "本月 1M", "三月 3M", "全年 1Y", "1周±", "1月±", "3月±", "1年±"]
@@ -657,7 +687,7 @@ def main():
 
     # ── 加仓价位参考 ──────────────────────────────────────────────────────
     st.divider()
-    render_buy_zones(holding_results + watchlist_results, data, positions, budgets)
+    render_buy_zones(holding_results + watchlist_results, data, positions, budgets, txn_df)
 
 
 if __name__ == "__main__":
