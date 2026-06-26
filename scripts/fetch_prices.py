@@ -20,6 +20,11 @@ TICKERS = [
     "SPY",   # benchmark for comparison
     "XMAX",  # current small position
     "SPCX",  # current 1-share position, very high volatility
+    "MU",    # watchlist, AI memory/HBM
+    "ETN",   # watchlist, power/grid equipment
+    "GEV",   # watchlist, power/grid equipment
+    "MOD",   # watchlist, data center liquid cooling
+    "JBL",   # watchlist, contract manufacturer for data center hardware
 ]
 
 PRICES_DIR = Path(__file__).parent.parent / "data" / "prices"

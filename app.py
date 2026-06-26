@@ -599,7 +599,7 @@ def render_exit_alerts(positions, budgets, data, txn_df):
 # ── Main App ───────────────────────────────────────────────────────────────────
 
 HOLDINGS  = ["VOO", "QQQ", "NVDA"]          # 我现在持有的
-WATCHLIST = ["SMH", "FCX", "AMAT", "LRCX", "MU"]  # 观察中，还没买
+WATCHLIST = ["SMH", "FCX", "AMAT", "LRCX", "MU", "ETN", "GEV", "MOD", "JBL"]  # 观察中，还没买
 
 def render_table(results):
     header = ["标的", "价格", "今日 1D", "本周 1W", "本月 1M", "三月 3M", "全年 1Y", "1周±", "1月±", "3月±", "1年±"]
