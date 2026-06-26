@@ -381,13 +381,20 @@ def compute_positions(txn_df):
     return {t: p for t, p in positions.items() if p["shares"] > 1e-6}
 
 def load_buy_plan():
-    """Returns {ticker: {category, monthly_budget_usd}}. Each ticker gets a fresh
-    budget every calendar month — unused budget does NOT roll over."""
+    """Returns {ticker: {category, monthly_budget_usd, stop_loss_pct, take_profit_pct}}.
+    Budget is fresh every calendar month — unused budget does NOT roll over.
+    stop_loss_pct/take_profit_pct are only set for category=="speculative" tickers;
+    core holdings are buy-and-hold with no exit tracking."""
     if not BUY_PLAN_PATH.exists():
         return {}
     df = pd.read_csv(BUY_PLAN_PATH)
     return {
-        row["ticker"]: {"category": row["category"], "monthly_budget_usd": row["monthly_budget_usd"]}
+        row["ticker"]: {
+            "category": row["category"],
+            "monthly_budget_usd": row["monthly_budget_usd"],
+            "stop_loss_pct": row.get("stop_loss_pct"),
+            "take_profit_pct": row.get("take_profit_pct"),
+        }
         for _, row in df.iterrows()
     }
 
@@ -521,6 +528,35 @@ def render_voo_recurring_check(data):
         st.success(f"📌 VOO 与 QQQ 近3个月日收益相关性降到 {corr:.2f}（<0.85），重叠度下降，可以考虑恢复 VOO 定投。")
     else:
         st.caption(f"📌 VOO 与 QQQ 近3个月相关性 {corr:.2f}，仍然高度重叠 —— 按计划，VOO 只低点加仓，不恢复定投。")
+
+def render_exit_alerts(positions, budgets, data):
+    """Take-profit / stop-loss check — only for category=='speculative' tickers.
+    Core holdings (VOO/QQQ/NVDA/...) are buy-and-hold by design and never flagged here."""
+    alerts = []
+    for t, plan in budgets.items():
+        if plan.get("category") != "speculative":
+            continue
+        pos = positions.get(t)
+        if not pos or t not in data:
+            continue
+        price = float(data[t]["Close"].iloc[-1])
+        pnl_pct = (price - pos["avg_cost"]) / pos["avg_cost"] * 100 if pos["avg_cost"] else 0
+        sl = plan.get("stop_loss_pct")
+        tp = plan.get("take_profit_pct")
+        if pd.notna(sl) and pnl_pct <= sl:
+            alerts.append(("loss", t, pnl_pct, sl))
+        elif pd.notna(tp) and pnl_pct >= tp:
+            alerts.append(("profit", t, pnl_pct, tp))
+
+    if not alerts:
+        return
+    st.markdown("### ⚠️ 投机仓位止盈/止损提醒")
+    st.caption("只针对投机性小仓位（XMAX/SPCX），核心仓位不在此提醒范围内，按计划长期持有。")
+    for kind, t, pnl_pct, threshold in alerts:
+        if kind == "loss":
+            st.error(f"🔴 **{t}** 浮亏 {pnl_pct:+.1f}%，已跌破止损线 {threshold:.0f}%，考虑是否止损。")
+        else:
+            st.success(f"🟢 **{t}** 浮盈 {pnl_pct:+.1f}%，已达止盈线 {threshold:.0f}%，考虑部分获利了结。")
 
 
 # ── Main App ───────────────────────────────────────────────────────────────────
@@ -671,9 +707,11 @@ def main():
 
     # ── 我的持仓 ──────────────────────────────────────────────────────────
     st.markdown("### 💼 我的持仓")
+    st.caption("核心仓位（VOO/QQQ/NVDA等）买入持有为主：表里的 SELL/STRONG_SELL 只是技术面偏弱的提示，不是卖出建议。真正的止盈止损提醒只针对投机仓位，见下方。")
     if holding_results:
         render_table(holding_results)
         render_voo_recurring_check(data)
+        render_exit_alerts(positions, budgets, data)
         st.divider()
         render_charts(holding_results, data, "点击展开 K 线图")
 
