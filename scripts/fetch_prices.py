@@ -12,16 +12,15 @@ from datetime import date, timedelta
 # ── Watchlist ────────────────────────────────────────────────────────────────
 # current holdings + target additions + benchmark
 TICKERS = [
-    "VOO",   # current core, broad S&P 500
+    "VOO",   # current core, broad S&P 500 — dip-buy only now, recurring canceled (overlaps QQQ)
     "QQQ",   # current + recurring buy, Nasdaq-100
     "QQQM",  # cheaper version of QQQ (same index, lower fee)
     "NVDA",  # current single-stock position
     "SMH",   # target addition, semiconductor ETF
     "SPY",   # benchmark for comparison
+    "XMAX",  # current small position
+    "SPCX",  # current 1-share position, very high volatility
 ]
-
-# XMAX and SPCX skipped: XMAX ticker is unverified, SPCX shows 0 shares.
-# Add them back once confirmed.
 
 PRICES_DIR = Path(__file__).parent.parent / "data" / "prices"
 PRICES_DIR.mkdir(parents=True, exist_ok=True)

@@ -2,6 +2,11 @@
 data/prices/
 data/signals_*.csv
 
+# Personal financial data — never commit (local-only by design)
+data/transactions.csv
+data/buy_plan.csv
+data/portfolio_snapshot_*.csv
+
 # macOS
 .DS_Store
 

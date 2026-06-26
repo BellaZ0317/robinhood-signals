@@ -12,6 +12,12 @@ import numpy as np
 import yfinance as yf
 import plotly.graph_objects as go
 from datetime import date, timedelta
+from pathlib import Path
+
+# ── Personal data paths (local-only, gitignored — absent on the public deploy) ──
+DATA_DIR           = Path(__file__).parent / "data"
+TRANSACTIONS_PATH  = DATA_DIR / "transactions.csv"
+BUY_PLAN_PATH      = DATA_DIR / "buy_plan.csv"
 
 # ── Page config ────────────────────────────────────────────────────────────────
 st.set_page_config(
@@ -349,6 +355,144 @@ def colored_pct(v):
         return "—"
 
 
+# ── Personal portfolio (local-only) ────────────────────────────────────────────
+
+def load_transactions():
+    """Returns the transaction log, or None if it doesn't exist (e.g. on the public deploy)."""
+    if not TRANSACTIONS_PATH.exists():
+        return None
+    return pd.read_csv(TRANSACTIONS_PATH, parse_dates=["date"]).sort_values("date")
+
+def compute_positions(txn_df):
+    """Weighted-average-cost method. Returns {ticker: {shares, cost_basis, avg_cost}}."""
+    positions = {}
+    for _, row in txn_df.iterrows():
+        t = row["ticker"]
+        pos = positions.setdefault(t, {"shares": 0.0, "cost_basis": 0.0})
+        if row["action"] == "buy":
+            pos["shares"] += row["shares"]
+            pos["cost_basis"] += row["amount_usd"]
+        elif row["action"] == "sell":
+            avg_cost = pos["cost_basis"] / pos["shares"] if pos["shares"] > 0 else 0
+            pos["cost_basis"] -= avg_cost * row["shares"]
+            pos["shares"] -= row["shares"]
+    for pos in positions.values():
+        pos["avg_cost"] = pos["cost_basis"] / pos["shares"] if pos["shares"] > 1e-9 else 0.0
+    return {t: p for t, p in positions.items() if p["shares"] > 1e-6}
+
+def load_buy_plan():
+    if not BUY_PLAN_PATH.exists():
+        return {}
+    df = pd.read_csv(BUY_PLAN_PATH)
+    return dict(zip(df["ticker"], df["budget_usd"]))
+
+
+# ── Buy-zone (加仓价位) logic ───────────────────────────────────────────────────
+
+BUY_ZONE_TIERS = [("浅回撤", 0.92), ("中等回撤", 0.85), ("深度回撤", 0.75)]
+
+def compute_buy_zones(df):
+    """Pullback tiers off the trailing ~6-month closing high. Public-safe — no $ amounts."""
+    close = df["Close"]
+    recent_high = float(close.tail(126).max())
+    price = float(close.iloc[-1])
+    tiers = []
+    for label, mult in BUY_ZONE_TIERS:
+        tier_price = recent_high * mult
+        tiers.append({
+            "label": label,
+            "price": tier_price,
+            "triggered": price <= tier_price,
+            "gap_pct": (price / tier_price - 1) * 100,
+        })
+    return {"recent_high": recent_high, "price": price, "tiers": tiers}
+
+def render_buy_zones(results, data, positions, budgets):
+    st.markdown("### 🎯 加仓 / 建仓价位参考")
+    st.caption("基于近6个月收盘高点的回撤档位，越跌建议买得越多。技术面参考，不是预测。")
+
+    has_personal = bool(positions)
+    header = ["标的", "现价", "近6月高点", "档1 浅回撤(-8%)", "档2 中等回撤(-15%)", "档3 深度回撤(-25%)"]
+    if has_personal:
+        header += ["你的持仓", "档1/2/3 建议金额"]
+
+    rows = []
+    for r in results:
+        t = r["ticker"]
+        if t not in data:
+            continue
+        z = compute_buy_zones(data[t])
+        cells = [f"<strong>{t}</strong>", f"${z['price']:.2f}", f"${z['recent_high']:.2f}"]
+        for tier in z["tiers"]:
+            tag = "✅ 已触发" if tier["triggered"] else f"还差 {tier['gap_pct']:.1f}%"
+            color = "#1a8f4a" if tier["triggered"] else "#646a73"
+            cells.append(f"${tier['price']:.2f}<br><span style='color:{color};font-size:11px'>{tag}</span>")
+        if has_personal:
+            pos = positions.get(t)
+            if pos:
+                pnl_pct = (z["price"] - pos["avg_cost"]) / pos["avg_cost"] * 100 if pos["avg_cost"] else 0
+                pnl_color = "#1a8f4a" if pnl_pct >= 0 else "#c84b2b"
+                cells.append(
+                    f"{pos['shares']:.2f}股 @ ${pos['avg_cost']:.2f}"
+                    f"<br><span style='color:{pnl_color};font-size:11px'>{pnl_pct:+.1f}%</span>"
+                )
+            else:
+                cells.append("—")
+            budget = budgets.get(t)
+            if budget:
+                amounts = " / ".join(f"${budget*ratio:.0f}" for ratio in (0.3, 0.3, 0.4))
+                cells.append(amounts)
+            else:
+                cells.append("未设预算")
+        rows.append(cells)
+
+    if not rows:
+        return
+
+    html = (
+        "<style>.buy-tbl{width:100%;border-collapse:collapse;font-size:13px}"
+        ".buy-tbl th{background:#f1f4f6;padding:8px 10px;text-align:center;border-bottom:2px solid #d9dde3;white-space:nowrap}"
+        ".buy-tbl td{padding:8px 10px;border-bottom:1px solid #d9dde3;text-align:center;white-space:nowrap}"
+        ".buy-tbl td:first-child{text-align:left}</style>"
+        '<table class="buy-tbl"><thead><tr>'
+        + "".join(f"<th>{h}</th>" for h in header)
+        + "</tr></thead><tbody>"
+        + "".join("<tr>" + "".join(f"<td>{c}</td>" for c in row) + "</tr>" for row in rows)
+        + "</tbody></table>"
+    )
+    st.markdown(html, unsafe_allow_html=True)
+
+    if has_personal:
+        total_cost = sum(p["cost_basis"] for p in positions.values())
+        total_value = sum(
+            p["shares"] * compute_buy_zones(data[t])["price"]
+            for t, p in positions.items() if t in data
+        )
+        total_pnl = total_value - total_cost
+        total_pnl_pct = total_pnl / total_cost * 100 if total_cost else 0
+        pnl_color = "#1a8f4a" if total_pnl >= 0 else "#c84b2b"
+        st.markdown(
+            f"**持仓总市值：${total_value:,.2f}**　"
+            f"<span style='color:{pnl_color}'>总盈亏：{'+' if total_pnl>=0 else ''}{total_pnl:,.2f} "
+            f"({total_pnl_pct:+.1f}%)</span>",
+            unsafe_allow_html=True,
+        )
+
+def render_voo_recurring_check(data):
+    """VOO recurring buy was canceled due to overlap with QQQ — flag if that overlap has eased."""
+    if "VOO" not in data or "QQQ" not in data:
+        return
+    voo_ret = data["VOO"]["Close"].pct_change().tail(90)
+    qqq_ret = data["QQQ"]["Close"].pct_change().tail(90)
+    corr = voo_ret.corr(qqq_ret)
+    if pd.isna(corr):
+        return
+    if corr < 0.85:
+        st.success(f"📌 VOO 与 QQQ 近3个月日收益相关性降到 {corr:.2f}（<0.85），重叠度下降，可以考虑恢复 VOO 定投。")
+    else:
+        st.caption(f"📌 VOO 与 QQQ 近3个月相关性 {corr:.2f}，仍然高度重叠 —— 按计划，VOO 只低点加仓，不恢复定投。")
+
+
 # ── Main App ───────────────────────────────────────────────────────────────────
 
 HOLDINGS  = ["VOO", "QQQ", "NVDA"]          # 我现在持有的
@@ -466,8 +610,14 @@ def main():
         st.divider()
         st.markdown("🟢 绿色↑ = 看涨K线形态\n\n🔴 红色↓ = 看跌K线形态\n\n虚线 = Bollinger Bands")
 
+    # ── Personal data (local-only; None/{} on the public deploy) ────────────
+    txn_df    = load_transactions()
+    positions = compute_positions(txn_df) if txn_df is not None else {}
+    budgets   = load_buy_plan() if txn_df is not None else {}
+    extra_holdings = [t for t in positions if t not in HOLDINGS]
+
     # ── Fetch ─────────────────────────────────────────────────────────────
-    all_tickers = list(dict.fromkeys(HOLDINGS + WATCHLIST + extra_tickers))
+    all_tickers = list(dict.fromkeys(HOLDINGS + extra_holdings + WATCHLIST + extra_tickers))
     data = fetch_data(tuple(all_tickers + ["SPY"]))
     if "SPY" not in data:
         st.error("🚫 网络错误，无法获取数据。请点击侧边栏 [立即刷新数据] 重试。")
@@ -486,13 +636,14 @@ def main():
                 out.append(r)
         return out
 
-    holding_results  = get_results(HOLDINGS)
+    holding_results  = get_results(HOLDINGS + extra_holdings)
     watchlist_results = get_results(WATCHLIST + extra_tickers)
 
     # ── 我的持仓 ──────────────────────────────────────────────────────────
     st.markdown("### 💼 我的持仓")
     if holding_results:
         render_table(holding_results)
+        render_voo_recurring_check(data)
         st.divider()
         render_charts(holding_results, data, "点击展开 K 线图")
 
@@ -503,6 +654,10 @@ def main():
         render_table(watchlist_results)
         st.divider()
         render_charts(watchlist_results, data, "点击展开 K 线图")
+
+    # ── 加仓价位参考 ──────────────────────────────────────────────────────
+    st.divider()
+    render_buy_zones(holding_results + watchlist_results, data, positions, budgets)
 
 
 if __name__ == "__main__":
