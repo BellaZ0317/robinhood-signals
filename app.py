@@ -218,7 +218,7 @@ def analyze_df(ticker, df, bench_close):
 
 @st.cache_data(ttl=900, show_spinner="📡 拉取市场数据中，约15秒…")
 def fetch_data(tickers_tuple):
-    end = date.today(); start = end - timedelta(days=400)
+    end = date.today() + timedelta(days=1); start = end - timedelta(days=400)
     data = {}
     for t in tickers_tuple:
         for attempt in range(3):
