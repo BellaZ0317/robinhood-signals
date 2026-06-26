@@ -381,9 +381,10 @@ def compute_positions(txn_df):
     return {t: p for t, p in positions.items() if p["shares"] > 1e-6}
 
 def load_buy_plan():
-    """Returns {ticker: {category, monthly_budget_usd, stop_loss_pct, take_profit_pct}}.
+    """Returns {ticker: {category, monthly_budget_usd, stop_loss_pct, take_profit_pct,
+    stop_loss_sell_fraction, take_profit_sell_fraction, min_hold_days}}.
     Budget is fresh every calendar month — unused budget does NOT roll over.
-    stop_loss_pct/take_profit_pct are only set for category=="speculative" tickers;
+    Exit-related fields are only set for category=="speculative" tickers;
     core holdings are buy-and-hold with no exit tracking."""
     if not BUY_PLAN_PATH.exists():
         return {}
@@ -394,6 +395,9 @@ def load_buy_plan():
             "monthly_budget_usd": row["monthly_budget_usd"],
             "stop_loss_pct": row.get("stop_loss_pct"),
             "take_profit_pct": row.get("take_profit_pct"),
+            "stop_loss_sell_fraction": row.get("stop_loss_sell_fraction"),
+            "take_profit_sell_fraction": row.get("take_profit_sell_fraction"),
+            "min_hold_days": row.get("min_hold_days"),
         }
         for _, row in df.iterrows()
     }
@@ -529,9 +533,13 @@ def render_voo_recurring_check(data):
     else:
         st.caption(f"📌 VOO 与 QQQ 近3个月相关性 {corr:.2f}，仍然高度重叠 —— 按计划，VOO 只低点加仓，不恢复定投。")
 
-def render_exit_alerts(positions, budgets, data):
+DEFAULT_MIN_HOLD_DAYS = 30
+
+def render_exit_alerts(positions, budgets, data, txn_df):
     """Take-profit / stop-loss check — only for category=='speculative' tickers.
-    Core holdings (VOO/QQQ/NVDA/...) are buy-and-hold by design and never flagged here."""
+    Core holdings (VOO/QQQ/NVDA/...) are buy-and-hold by design and never flagged here.
+    Two guardrails against over-trading: a minimum holding period before any alert
+    becomes actionable, and a partial sell-fraction (never suggests selling 100%)."""
     alerts = []
     for t, plan in budgets.items():
         if plan.get("category") != "speculative":
@@ -541,22 +549,51 @@ def render_exit_alerts(positions, budgets, data):
             continue
         price = float(data[t]["Close"].iloc[-1])
         pnl_pct = (price - pos["avg_cost"]) / pos["avg_cost"] * 100 if pos["avg_cost"] else 0
-        sl = plan.get("stop_loss_pct")
-        tp = plan.get("take_profit_pct")
+        sl, tp = plan.get("stop_loss_pct"), plan.get("take_profit_pct")
+
+        first_buy = txn_df.loc[(txn_df["ticker"] == t) & (txn_df["action"] == "buy"), "date"].min()
+        days_held = (pd.Timestamp(date.today()) - first_buy).days if pd.notna(first_buy) else 0
+        min_hold = plan.get("min_hold_days")
+        min_hold = DEFAULT_MIN_HOLD_DAYS if pd.isna(min_hold) else int(min_hold)
+        eligible = days_held >= min_hold
+
         if pd.notna(sl) and pnl_pct <= sl:
-            alerts.append(("loss", t, pnl_pct, sl))
+            frac = plan.get("stop_loss_sell_fraction")
+            frac = 0.5 if pd.isna(frac) else float(frac)
+            alerts.append(("loss", t, pnl_pct, sl, frac, eligible, days_held, min_hold))
         elif pd.notna(tp) and pnl_pct >= tp:
-            alerts.append(("profit", t, pnl_pct, tp))
+            frac = plan.get("take_profit_sell_fraction")
+            frac = 0.33 if pd.isna(frac) else float(frac)
+            alerts.append(("profit", t, pnl_pct, tp, frac, eligible, days_held, min_hold))
 
     if not alerts:
         return
     st.markdown("### ⚠️ 投机仓位止盈/止损提醒")
-    st.caption("只针对投机性小仓位（XMAX/SPCX），核心仓位不在此提醒范围内，按计划长期持有。")
-    for kind, t, pnl_pct, threshold in alerts:
+    st.caption("只针对投机性小仓位（XMAX/SPCX）。未满最短持有期不会建议操作；触发时只建议卖出一部分，不会建议清仓。")
+    for kind, t, pnl_pct, threshold, frac, eligible, days_held, min_hold in alerts:
+        shares = positions[t]["shares"] * frac
         if kind == "loss":
-            st.error(f"🔴 **{t}** 浮亏 {pnl_pct:+.1f}%，已跌破止损线 {threshold:.0f}%，考虑是否止损。")
+            if eligible:
+                st.error(
+                    f"🔴 **{t}** 浮亏 {pnl_pct:+.1f}%，跌破止损线 {threshold:.0f}%（已持有{days_held}天）。"
+                    f"建议卖出约 {frac*100:.0f}%（≈{shares:.2f}股），保留剩余继续观察。"
+                )
+            else:
+                st.warning(
+                    f"🟡 **{t}** 浮亏 {pnl_pct:+.1f}% 已跌破止损线，但只持有{days_held}天"
+                    f"（最短持有期{min_hold}天），先观察，暂不建议操作。"
+                )
         else:
-            st.success(f"🟢 **{t}** 浮盈 {pnl_pct:+.1f}%，已达止盈线 {threshold:.0f}%，考虑部分获利了结。")
+            if eligible:
+                st.success(
+                    f"🟢 **{t}** 浮盈 {pnl_pct:+.1f}%，达到止盈线 {threshold:.0f}%（已持有{days_held}天）。"
+                    f"建议卖出约 {frac*100:.0f}%（≈{shares:.2f}股）锁定部分利润，剩余继续持有。"
+                )
+            else:
+                st.info(
+                    f"🔵 **{t}** 浮盈 {pnl_pct:+.1f}% 已达止盈线，但只持有{days_held}天"
+                    f"（最短持有期{min_hold}天），先观察，暂不建议操作。"
+                )
 
 
 # ── Main App ───────────────────────────────────────────────────────────────────
@@ -711,7 +748,7 @@ def main():
     if holding_results:
         render_table(holding_results)
         render_voo_recurring_check(data)
-        render_exit_alerts(positions, budgets, data)
+        render_exit_alerts(positions, budgets, data, txn_df)
         st.divider()
         render_charts(holding_results, data, "点击展开 K 线图")
 
