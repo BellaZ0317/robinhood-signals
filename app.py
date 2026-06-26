@@ -5,6 +5,7 @@ Deploy: streamlit.io/cloud (free)
 Local:  streamlit run app.py
 """
 
+import time
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -214,15 +215,19 @@ def fetch_data(tickers_tuple):
     end = date.today(); start = end - timedelta(days=400)
     data = {}
     for t in tickers_tuple:
-        try:
-            df = yf.download(t, start=str(start), end=str(end), auto_adjust=True, progress=False)
-            if isinstance(df.columns, pd.MultiIndex):
-                df.columns = df.columns.get_level_values(0)
-            df.index.name = "date"
-            if not df.empty:
-                data[t] = df.sort_index()
-        except Exception:
-            pass
+        for attempt in range(3):
+            try:
+                df = yf.download(t, start=str(start), end=str(end), auto_adjust=True, progress=False)
+                if isinstance(df.columns, pd.MultiIndex):
+                    df.columns = df.columns.get_level_values(0)
+                df.index.name = "date"
+                if not df.empty:
+                    data[t] = df.sort_index()
+                    break
+            except Exception:
+                pass
+            if attempt < 2:
+                time.sleep(1.5)
     return data
 
 
@@ -379,15 +384,19 @@ def render_table(results):
     )
     st.markdown(html, unsafe_allow_html=True)
 
+SIGNAL_EMOJI = {
+    "STRONG_BUY": "🟢🟢", "BUY": "🟢",
+    "HOLD": "🟡", "SELL": "🔴", "STRONG_SELL": "🔴🔴",
+}
+
 def render_charts(results, data, label):
     st.caption(f"{label}  |  绿色↑ = 看涨形态  |  红色↓ = 看跌形态  |  虚线 = Bollinger Bands")
     for r in results:
         t      = r["ticker"]
         sig_1d = r["signal_1d"]
         sig_zh = SIGNAL_ZH.get(sig_1d, sig_1d)
-        sig_c  = SIGNAL_COLOR.get(sig_1d, "#666")
-        label_str = (f"**{t}** &nbsp; ${r['price']:.2f} &nbsp; — &nbsp;"
-                     f"<span style='color:{sig_c};font-weight:700'>今日：{sig_zh}</span>")
+        emoji  = SIGNAL_EMOJI.get(sig_1d, "")
+        label_str = f"{t}   ${r['price']:.2f}   —   今日：{emoji} {sig_zh}"
         with st.expander(label_str, expanded=(t in ("QQQ", "NVDA"))):
             c1, c2, c3, c4 = st.columns(4)
             bb_val = r.get("bb_pct"); vr_val = r.get("vol_ratio")
