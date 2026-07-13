@@ -18,3 +18,6 @@ __pycache__/
 
 # Reports (generated locally)
 reports/
+
+# Secrets — never commit (contains Google service account key + app password)
+.streamlit/secrets.toml

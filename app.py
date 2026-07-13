@@ -10,14 +10,19 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import yfinance as yf
+import gspread
+from google.oauth2.service_account import Credentials
 import plotly.graph_objects as go
 from datetime import date, timedelta
 from pathlib import Path
 
-# ── Personal data paths (local-only, gitignored — absent on the public deploy) ──
+# ── Personal data paths ────────────────────────────────────────────────────────
+# buy_plan.csv stays local-only (gitignored, absent on the public deploy).
+# Transactions now live in Google Sheets so they're readable/writable from any
+# device, gated behind the password check in check_password().
 DATA_DIR           = Path(__file__).parent / "data"
-TRANSACTIONS_PATH  = DATA_DIR / "transactions.csv"
 BUY_PLAN_PATH      = DATA_DIR / "buy_plan.csv"
+TRANSACTIONS_COLUMNS = ["date", "ticker", "action", "shares", "price", "amount_usd", "notes"]
 
 # ── Page config ────────────────────────────────────────────────────────────────
 st.set_page_config(
@@ -355,13 +360,51 @@ def colored_pct(v):
         return "—"
 
 
-# ── Personal portfolio (local-only) ────────────────────────────────────────────
+# ── Password gate ──────────────────────────────────────────────────────────────
+# Guards the transaction log / positions, which now live in Google Sheets and are
+# reachable (and writable) from any device once unlocked — not just localhost.
+
+def check_password():
+    if st.session_state.get("authed"):
+        return True
+    with st.sidebar:
+        pw = st.text_input("🔒 输入密码查看/录入持仓", type="password", key="pw_input")
+        if pw:
+            if pw == st.secrets.get("app_password"):
+                st.session_state["authed"] = True
+                st.rerun()
+            else:
+                st.error("密码错误")
+    return False
+
+
+# ── Google Sheets (transaction log) ────────────────────────────────────────────
+
+@st.cache_resource
+def _gsheet_client():
+    creds = Credentials.from_service_account_info(
+        st.secrets["gcp_service_account"],
+        scopes=["https://www.googleapis.com/auth/spreadsheets"],
+    )
+    return gspread.authorize(creds)
+
+def _transactions_ws():
+    return _gsheet_client().open_by_key(st.secrets["transactions_sheet_id"]).sheet1
 
 def load_transactions():
-    """Returns the transaction log, or None if it doesn't exist (e.g. on the public deploy)."""
-    if not TRANSACTIONS_PATH.exists():
+    """Returns the transaction log from Google Sheets, or None if secrets aren't configured."""
+    try:
+        records = _transactions_ws().get_all_records()
+    except Exception as e:
+        st.sidebar.error(f"⚠️ 无法连接交易记录表：{e}")
         return None
-    return pd.read_csv(TRANSACTIONS_PATH, parse_dates=["date"]).sort_values("date")
+    df = pd.DataFrame(records, columns=TRANSACTIONS_COLUMNS)
+    if df.empty:
+        return df
+    df["date"] = pd.to_datetime(df["date"])
+    for col in ("shares", "price", "amount_usd"):
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+    return df.sort_values("date")
 
 def compute_positions(txn_df):
     """Weighted-average-cost method. Returns {ticker: {shares, cost_basis, avg_cost}}."""
@@ -685,6 +728,74 @@ def render_charts(results, data, label):
                         unsafe_allow_html=True,
                     )
 
+def _price_on(ticker, d):
+    """Closing price on date d, or the nearest earlier trading day (weekends/holidays)."""
+    hist = yf.download(ticker, start=str(d - timedelta(days=7)), end=str(d + timedelta(days=1)),
+                        progress=False, auto_adjust=True)
+    if isinstance(hist.columns, pd.MultiIndex):
+        hist.columns = hist.columns.get_level_values(0)
+    if hist.empty:
+        return None
+    return float(hist["Close"].iloc[-1])
+
+def render_transaction_form(txn_df):
+    """Sidebar form to record a new buy/sell transaction, written to Google Sheets.
+    Only called once the password gate in check_password() has been passed.
+    Takes a dollar amount (matches how Robinhood dollar-based buys work) — price is
+    looked up automatically and shares are derived, so nothing needs to be calculated by hand."""
+    st.divider()
+    st.markdown("### 📝 录入交易")
+
+    with st.form("txn_form", clear_on_submit=True):
+        col1, col2 = st.columns([2, 1])
+        with col1:
+            ticker_raw = st.text_input("股票代码", placeholder="NVDA")
+        with col2:
+            action = st.selectbox("操作", ["buy", "sell"])
+
+        txn_date = st.date_input("日期", value=date.today())
+        amount = st.number_input("金额 ($)", min_value=0.0, step=1.0,
+                                 format="%.2f", value=0.0)
+
+        notes = st.text_input("备注（可选）", placeholder="limit buy / 定投 …")
+        st.caption("股数会用当天收盘价自动换算，不用自己算")
+        submitted = st.form_submit_button("✅ 确认录入", use_container_width=True,
+                                          type="primary")
+
+    if submitted:
+        ticker = ticker_raw.strip().upper()
+        if not ticker:
+            st.error("请输入股票代码")
+        elif amount <= 0:
+            st.error("金额必须 > 0")
+        else:
+            with st.spinner(f"查询 {ticker} 在 {txn_date} 的价格…"):
+                price = _price_on(ticker, txn_date)
+            if price is None:
+                st.error(f"⚠️ 查不到 {ticker} 的价格，请检查股票代码是否正确")
+            else:
+                shares = amount / price
+                try:
+                    _transactions_ws().append_row([
+                        str(txn_date), ticker, action,
+                        round(shares, 6), round(price, 2), round(amount, 2), notes,
+                    ])
+                except Exception as e:
+                    st.error(f"⚠️ 写入交易记录表失败：{e}")
+                else:
+                    st.success(f"✅ {action.upper()} {ticker} ${amount:.2f} @ ${price:.2f} ≈ {shares:.4f}股")
+                    st.cache_data.clear()
+                    st.rerun()
+
+    # Show last 3 transactions as confirmation
+    if txn_df is not None and not txn_df.empty:
+        st.caption("最近录入")
+        for _, row in txn_df.tail(3).iterrows():
+            emoji = "🟢" if row["action"] == "buy" else "🔴"
+            st.caption(f"{emoji} {row['date'].date()}  {row['ticker']}  "
+                       f"{row['shares']:.4f}股 @${row['price']:.2f}")
+
+
 def main():
     # ── Header ────────────────────────────────────────────────────────────
     st.markdown("## 📈 Abby 投资信号仪表盘")
@@ -713,10 +824,16 @@ def main():
         st.divider()
         st.markdown("🟢 绿色↑ = 看涨K线形态\n\n🔴 红色↓ = 看跌K线形态\n\n虚线 = Bollinger Bands")
 
-    # ── Personal data (local-only; None/{} on the public deploy) ────────────
-    txn_df    = load_transactions()
-    positions = compute_positions(txn_df) if txn_df is not None else {}
-    budgets   = load_buy_plan() if txn_df is not None else {}
+        unlocked = check_password()
+        if unlocked:
+            txn_df = load_transactions()
+            render_transaction_form(txn_df)
+        else:
+            txn_df = None
+
+    # ── Personal data (requires password; None/{} otherwise) ────────────────
+    positions = compute_positions(txn_df) if txn_df is not None and not txn_df.empty else {}
+    budgets   = load_buy_plan() if unlocked else {}
     extra_holdings = [t for t in positions if t not in HOLDINGS]
 
     # ── Fetch ─────────────────────────────────────────────────────────────
@@ -745,6 +862,8 @@ def main():
     # ── 我的持仓 ──────────────────────────────────────────────────────────
     st.markdown("### 💼 我的持仓")
     st.caption("核心仓位（VOO/QQQ/NVDA等）买入持有为主：表里的 SELL/STRONG_SELL 只是技术面偏弱的提示，不是卖出建议。真正的止盈止损提醒只针对投机仓位，见下方。")
+    if not unlocked:
+        st.caption("🔒 在侧边栏输入密码可以查看/录入你的持仓成本、盈亏和交易记录（技术信号上方任何人都能看）。")
     if holding_results:
         render_table(holding_results)
         render_voo_recurring_check(data)
