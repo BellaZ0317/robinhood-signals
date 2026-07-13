@@ -461,8 +461,8 @@ def monthly_spent(txn_df, ticker, today=None):
 
 # ── Buy-zone (加仓价位) logic ───────────────────────────────────────────────────
 
-BUY_ZONE_TIERS = [("浅回撤", 0.92), ("中等回撤", 0.85), ("深度回撤", 0.75)]
-TIER_RATIOS = (0.3, 0.3, 0.4)
+BUY_ZONE_TIERS = [("中等回撤", 0.85), ("深度回撤", 0.75)]
+TIER_RATIOS = (0.4, 0.6)
 
 def compute_buy_zones(df):
     """Pullback tiers off the trailing ~6-month closing high. Public-safe — no $ amounts."""
@@ -488,7 +488,7 @@ def render_buy_zones(results, data, positions, budgets, txn_df):
     )
 
     has_personal = bool(positions)
-    header = ["标的", "现价", "近6月高点", "档1 浅回撤(-8%)", "档2 中等回撤(-15%)", "档3 深度回撤(-25%)"]
+    header = ["现在建议买入", "标的", "现价", "近6月高点", "档2 中等回撤(-15%)", "档3 深度回撤(-25%)"]
     if has_personal:
         header += ["你的持仓"]
 
@@ -509,7 +509,16 @@ def render_buy_zones(results, data, positions, budgets, txn_df):
                 f"本月已花${spent:.0f}/${plan['monthly_budget_usd']:.0f}</span>"
             )
 
-        cells = [ticker_cell, f"${z['price']:.2f}", f"${z['recent_high']:.2f}"]
+        triggered_idx = [i for i, tier in enumerate(z["tiers"]) if tier["triggered"]]
+        if remaining is None:
+            reco_cell = "—"
+        elif triggered_idx:
+            reco_amount = remaining * TIER_RATIOS[triggered_idx[-1]]
+            reco_cell = f"<strong style='color:#1a8f4a;font-size:15px'>${reco_amount:.0f}</strong>"
+        else:
+            reco_cell = "<span style='color:#646a73'>观望</span>"
+
+        cells = [reco_cell, ticker_cell, f"${z['price']:.2f}", f"${z['recent_high']:.2f}"]
         for tier, ratio in zip(z["tiers"], TIER_RATIOS):
             tag = "✅ 已触发" if tier["triggered"] else f"还差 {tier['gap_pct']:.1f}%"
             color = "#1a8f4a" if tier["triggered"] else "#646a73"
@@ -537,7 +546,7 @@ def render_buy_zones(results, data, positions, budgets, txn_df):
         "<style>.buy-tbl{width:100%;border-collapse:collapse;font-size:13px}"
         ".buy-tbl th{background:#f1f4f6;padding:8px 10px;text-align:center;border-bottom:2px solid #d9dde3;white-space:nowrap}"
         ".buy-tbl td{padding:8px 10px;border-bottom:1px solid #d9dde3;text-align:center;white-space:nowrap}"
-        ".buy-tbl td:first-child{text-align:left}</style>"
+        ".buy-tbl td:nth-child(2){text-align:left}</style>"
         '<table class="buy-tbl"><thead><tr>'
         + "".join(f"<th>{h}</th>" for h in header)
         + "</tr></thead><tbody>"
@@ -862,6 +871,7 @@ def main():
     # ── 我的持仓 ──────────────────────────────────────────────────────────
     st.markdown("### 💼 我的持仓")
     st.caption("核心仓位（VOO/QQQ/NVDA等）买入持有为主：表里的 SELL/STRONG_SELL 只是技术面偏弱的提示，不是卖出建议。真正的止盈止损提醒只针对投机仓位，见下方。")
+    st.caption("⚠️ 下面 1D/1W/1M/3M/1Y 五个维度是技术面参考，不是操作指令——真正「现在该买多少钱」只有一个答案，看最下方「🎯加仓价位参考」表里的「现在建议买入」那一栏。")
     if not unlocked:
         st.caption("🔒 在侧边栏输入密码可以查看/录入你的持仓成本、盈亏和交易记录（技术信号上方任何人都能看）。")
     if holding_results:
@@ -874,6 +884,7 @@ def main():
     # ── 观察名单 ──────────────────────────────────────────────────────────
     st.markdown("### 👀 观察名单 Watchlist")
     st.caption("还没买，在看时机")
+    st.caption("⚠️ 下面 1D/1W/1M/3M/1Y 五个维度是技术面参考，不是操作指令——真正「现在该买多少钱」只有一个答案，看最下方「🎯加仓价位参考」表里的「现在建议买入」那一栏。")
     if watchlist_results:
         render_table(watchlist_results)
         st.divider()
