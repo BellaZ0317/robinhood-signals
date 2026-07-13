@@ -14,14 +14,11 @@ import gspread
 from google.oauth2.service_account import Credentials
 import plotly.graph_objects as go
 from datetime import date, timedelta
-from pathlib import Path
 
-# ── Personal data paths ────────────────────────────────────────────────────────
-# buy_plan.csv stays local-only (gitignored, absent on the public deploy).
-# Transactions now live in Google Sheets so they're readable/writable from any
-# device, gated behind the password check in check_password().
-DATA_DIR           = Path(__file__).parent / "data"
-BUY_PLAN_PATH      = DATA_DIR / "buy_plan.csv"
+# ── Personal data ───────────────────────────────────────────────────────────────
+# Transactions and the monthly buy-plan/budget both live in Google Sheets (separate
+# tabs of the same spreadsheet) so they're readable/writable from any device,
+# gated behind the password check in check_password().
 TRANSACTIONS_COLUMNS = ["date", "ticker", "action", "shares", "price", "amount_usd", "notes"]
 
 # ── Page config ────────────────────────────────────────────────────────────────
@@ -391,6 +388,9 @@ def _gsheet_client():
 def _transactions_ws():
     return _gsheet_client().open_by_key(st.secrets["transactions_sheet_id"]).sheet1
 
+def _buy_plan_ws():
+    return _gsheet_client().open_by_key(st.secrets["transactions_sheet_id"]).worksheet("buy_plan")
+
 def load_transactions():
     """Returns the transaction log from Google Sheets, or None if secrets aren't configured."""
     try:
@@ -425,24 +425,29 @@ def compute_positions(txn_df):
 
 def load_buy_plan():
     """Returns {ticker: {category, monthly_budget_usd, stop_loss_pct, take_profit_pct,
-    stop_loss_sell_fraction, take_profit_sell_fraction, min_hold_days}}.
+    stop_loss_sell_fraction, take_profit_sell_fraction, min_hold_days}}, read from the
+    "buy_plan" tab of the same Google Sheet as transactions — reachable from the public
+    deploy too, gated behind the same password check.
     Budget is fresh every calendar month — unused budget does NOT roll over.
     Exit-related fields are only set for category=="speculative" tickers;
     core holdings are buy-and-hold with no exit tracking."""
-    if not BUY_PLAN_PATH.exists():
+    try:
+        records = _buy_plan_ws().get_all_records()
+    except Exception as e:
+        st.sidebar.error(f"⚠️ 无法连接月预算配置表：{e}")
         return {}
-    df = pd.read_csv(BUY_PLAN_PATH)
     return {
         row["ticker"]: {
             "category": row["category"],
-            "monthly_budget_usd": row["monthly_budget_usd"],
-            "stop_loss_pct": row.get("stop_loss_pct"),
-            "take_profit_pct": row.get("take_profit_pct"),
-            "stop_loss_sell_fraction": row.get("stop_loss_sell_fraction"),
-            "take_profit_sell_fraction": row.get("take_profit_sell_fraction"),
-            "min_hold_days": row.get("min_hold_days"),
+            "monthly_budget_usd": pd.to_numeric(row["monthly_budget_usd"], errors="coerce"),
+            "stop_loss_pct": pd.to_numeric(row.get("stop_loss_pct"), errors="coerce"),
+            "take_profit_pct": pd.to_numeric(row.get("take_profit_pct"), errors="coerce"),
+            "stop_loss_sell_fraction": pd.to_numeric(row.get("stop_loss_sell_fraction"), errors="coerce"),
+            "take_profit_sell_fraction": pd.to_numeric(row.get("take_profit_sell_fraction"), errors="coerce"),
+            "min_hold_days": pd.to_numeric(row.get("min_hold_days"), errors="coerce"),
         }
-        for _, row in df.iterrows()
+        for row in records
+        if row.get("ticker")
     }
 
 def monthly_spent(txn_df, ticker, today=None):
